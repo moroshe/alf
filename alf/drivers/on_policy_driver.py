@@ -18,6 +18,7 @@ from __future__ import division
 from __future__ import print_function
 
 import math
+from typing import Callable
 
 import gin.tf
 import tensorflow as tf
@@ -113,31 +114,30 @@ class OnPolicyDriver(policy_driver.PolicyDriver):
         self._final_step_mode = final_step_mode
 
         if training:
-            self._prepare_specs(env, algorithm)
+            self._prepare_specs(algorithm)
             self._trainable_variables = algorithm.trainable_variables
             self._train_interval = train_interval
 
-    def _prepare_specs(self, env, algorithm):
-        time_step_spec = env.time_step_spec()
+    def _prepare_specs(self, algorithm):
+        time_step_spec = self._env.time_step_spec()
         action_distribution_param_spec = tf.nest.map_structure(
             lambda spec: spec.input_params_spec,
             algorithm.action_distribution_spec)
 
         policy_step = algorithm.train_step(self.get_initial_time_step(),
-                                           self.get_initial_state())
+                                           self._initial_state)
         info_spec = tf.nest.map_structure(
             lambda t: tf.TensorSpec(t.shape[1:], t.dtype), policy_step.info)
 
         self._training_info_spec = make_training_info(
             action_distribution=action_distribution_param_spec,
-            action=env.action_spec(),
+            action=self._env.action_spec(),
             step_type=time_step_spec.step_type,
             reward=time_step_spec.reward,
             discount=time_step_spec.discount,
             info=info_spec)
 
     def _run(self, max_num_steps, time_step, policy_state):
-        """Take steps in the environment for max_num_steps."""
         if self._training:
             return self.train(max_num_steps, time_step, policy_state)
         else:
@@ -199,7 +199,7 @@ class OnPolicyDriver(policy_driver.PolicyDriver):
     def _iter(self, time_step, policy_state):
         """One training iteration."""
         counter = tf.zeros((), tf.int32)
-        batch_size = self.env.batch_size
+        batch_size = self._env.batch_size
 
         def create_ta(s):
             return tf.TensorArray(
@@ -211,7 +211,8 @@ class OnPolicyDriver(policy_driver.PolicyDriver):
         training_info_ta = tf.nest.map_structure(create_ta,
                                                  self._training_info_spec)
 
-        with tf.GradientTape(watch_accessed_variables=False) as tape:
+        with tf.GradientTape(
+                watch_accessed_variables=False, persistent=True) as tape:
             tape.watch(self._trainable_variables)
             [counter, time_step, policy_state,
              training_info_ta] = tf.while_loop(
@@ -230,10 +231,12 @@ class OnPolicyDriver(policy_driver.PolicyDriver):
                 time_step, policy_state)
             next_state = policy_step.state
         else:
-            policy_step = self.algorithm_step(
+            policy_step = common.algorithm_step(
+                self._algorithm,
+                self._observation_transformer,
                 time_step,
                 policy_state,
-                self._training,
+                training=self._training,
                 greedy_predict=self._greedy_predict)
             action = common.sample_action_distribution(policy_step.action)
             next_time_step = time_step
@@ -267,7 +270,9 @@ class OnPolicyDriver(policy_driver.PolicyDriver):
         loss_info, grads_and_vars = self._algorithm.train_complete(
             tape, training_info)
 
-        self._summary(training_info, loss_info, grads_and_vars)
+        del tape
+
+        self._training_summary(training_info, loss_info, grads_and_vars)
 
         self._train_step_counter.assign_add(1)
 

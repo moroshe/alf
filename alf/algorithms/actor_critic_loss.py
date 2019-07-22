@@ -20,10 +20,9 @@ import tensorflow_probability as tfp
 
 from tf_agents.agents.tf_agent import LossInfo
 from tf_agents.utils import common as tfa_common
-
 from alf.algorithms.rl_algorithm import TrainingInfo
 from alf.utils.losses import element_wise_squared_loss
-from alf.utils import common, value_ops
+from alf.utils import common, dist_utils, value_ops
 
 ActorCriticLossInfo = namedtuple("ActorCriticLossInfo",
                                  ["pg_loss", "td_loss", "entropy_loss"])
@@ -112,7 +111,7 @@ class ActorCriticLoss(object):
         returns, advantages = self._calc_returns_and_advantages(
             training_info, value)
 
-        if self._debug_summaries:
+        if self._debug_summaries and common.should_record_summaries():
             with tf.name_scope('ActorCriticLoss'):
                 tf.summary.scalar("values", tf.reduce_mean(value))
                 tf.summary.scalar("returns", tf.reduce_mean(returns))
@@ -135,10 +134,10 @@ class ActorCriticLoss(object):
 
         entropy_loss = ()
         if self._entropy_regularization is not None:
-            entropies = tfa_common.entropy(training_info.action_distribution,
-                                           self._action_spec)
-            entropy_loss = -entropies
-            loss += self._entropy_regularization * entropy_loss
+            entropy, entropy_for_gradient = dist_utils.entropy_with_fallback(
+                training_info.action_distribution, self._action_spec)
+            entropy_loss = -entropy
+            loss -= self._entropy_regularization * entropy_for_gradient
 
         return LossInfo(
             loss,

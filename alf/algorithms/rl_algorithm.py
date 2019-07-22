@@ -25,7 +25,7 @@ import tensorflow_probability as tfp
 from tf_agents.trajectories.time_step import StepType
 from tf_agents.utils import eager_utils
 
-import alf.utils.common as common
+import alf.utils as alf_utils
 
 TrainingInfo = namedtuple("TrainingInfo", [
     "action_distribution", "action", "step_type", "reward", "discount", "info",
@@ -142,11 +142,11 @@ class RLAlgorithm(tf.Module):
             predict_state_spec = train_state_spec
         self._predict_state_spec = predict_state_spec
         self._action_distribution_spec = action_distribution_spec
-        self._optimizers = common.as_list(optimizer)
+        self._optimizers = alf_utils.common.as_list(optimizer)
         if get_trainable_variables_func is None:
             get_trainable_variables_func = lambda: super(RLAlgorithm, self
                                                          ).trainable_variables
-        self._get_trainable_variables_funcs = common.as_list(
+        self._get_trainable_variables_funcs = alf_utils.common.as_list(
             get_trainable_variables_func)
         if optimizer:
             assert (len(self._optimizers) == len(
@@ -157,7 +157,7 @@ class RLAlgorithm(tf.Module):
         self._gradient_clipping = gradient_clipping
         self._clip_by_global_norm = clip_by_global_norm
         self._reward_shaping_fn = reward_shaping_fn
-        self._train_step_counter = common.get_global_counter(
+        self._train_step_counter = alf_utils.common.get_global_counter(
             train_step_counter)
         self._debug_summaries = debug_summaries
         self._cached_var_sets = None
@@ -275,17 +275,15 @@ class RLAlgorithm(tf.Module):
         valid_masks = tf.cast(
             tf.not_equal(training_info.step_type, StepType.LAST), tf.float32)
 
-        # reward unshaped extrinsic rewards given by the environment
-        self.add_reward_summary("environment_reward", training_info.reward)
-
         # reward shaping
         if self._reward_shaping_fn is not None:
+            # record unshaped extrinsic rewards given by the environment
+            self.add_reward_summary("reward/raw", training_info.reward)
             training_info = training_info._replace(
                 reward=self._reward_shaping_fn(training_info.reward))
 
         # record shaped extrinsic rewards actually used for training
-        self.add_reward_summary("training_reward/extrinsic",
-                                training_info.reward)
+        self.add_reward_summary("reward/extrinsic", training_info.reward)
 
         with tape:
             loss_info = self.calc_loss(training_info)
@@ -307,6 +305,7 @@ class RLAlgorithm(tf.Module):
                 else:
                     grads_and_vars = eager_utils.clip_gradient_norms(
                         grads_and_vars, self._gradient_clipping)
+
             optimizer.apply_gradients(grads_and_vars)
 
         return loss_info, all_grads_and_vars
@@ -323,10 +322,6 @@ class RLAlgorithm(tf.Module):
                 training_info.info are the batched from each policy_step.info
                 returned by train_step(). Note that training_info.next_discount
                 is 0 if the next step is the last step in an episode.
-            final_time_step (ActionTimeStep): the additional time_step
-            final_info (nested Tensor): `info` from additional
-                `train_step` evaluated from final_time_step or final_experience.
-                This final_info is NOT calculated under the context of `tape`
 
         Returns (LossInfo):
             loss at each time step for each sample in the batch. The shapes of

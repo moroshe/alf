@@ -18,8 +18,8 @@ import time
 
 from absl import logging
 import gin.tf
+from gym.wrappers.monitoring.video_recorder import VideoRecorder
 import tensorflow as tf
-import functools
 
 from tf_agents.eval import metric_utils
 from tf_agents.utils import common as tfa_common
@@ -32,7 +32,7 @@ from alf.utils.common import run_under_record_context, get_global_counter
 
 
 @gin.configurable
-def train(train_dir,
+def train(root_dir,
           env,
           algorithm,
           eval_env=None,
@@ -43,6 +43,7 @@ def train(train_dir,
           use_tf_functions=True,
           summary_interval=50,
           summaries_flush_secs=1,
+          summary_max_queue=10,
           eval_interval=10,
           num_eval_episodes=10,
           checkpoint_interval=1000,
@@ -54,7 +55,7 @@ def train(train_dir,
     additional prefix "driver_loop", it's might be a bug of tf2. We'll see.
 
     Args:
-        train_dir (str): directory for saving summary and checkpoints
+        root_dir (str): directory for saving summary and checkpoints
         env (TFEnvironment): environment for training
         algorithm (OnPolicyAlgorithm): the training algorithm
         eval_env (TFEnvironment): environment for evaluating
@@ -63,10 +64,12 @@ def train(train_dir,
         num_steps_per_iter (int): number of steps for one iteration. It is the
             total steps from all individual environment in the batch
             environment.
+        num_iterations (int): number of training iterations
         use_tf_functions (bool): whether to use tf.function
         summary_interval (int): write summary every so many training steps (
             i.e. number of parameter updates)
         summaries_flush_secs (int): flush summary to disk every so many seconds.
+        summary_max_queue (int): flush to disk every so many summaries
         eval_interval (int): evaluate every so many iteration
         num_eval_episodes (int) : number of episodes for one evaluation
         checkpoint_interval (int): checkpoint every so many iterations
@@ -75,8 +78,9 @@ def train(train_dir,
             summaries will be written during training.
     """
 
-    train_dir = os.path.expanduser(train_dir)
-    eval_dir = os.path.join(os.path.dirname(train_dir), 'eval')
+    root_dir = os.path.expanduser(root_dir)
+    train_dir = os.path.join(root_dir, 'train')
+    eval_dir = os.path.join(root_dir, 'eval')
 
     eval_metrics = None
     eval_summary_writer = None
@@ -107,12 +111,12 @@ def train(train_dir,
             global_step=global_step)
         checkpointer.initialize_or_restore()
 
-        if use_tf_functions:
-            driver.run = tf.function(driver.run)
+        if not use_tf_functions:
+            tf.config.experimental_run_functions_eagerly(True)
 
         env.reset()
         time_step = driver.get_initial_time_step()
-        policy_state = driver.get_initial_state()
+        policy_state = driver.get_initial_policy_state()
         for iter in range(num_iterations):
             t0 = time.time()
 
@@ -132,10 +136,14 @@ def train(train_dir,
                         metrics=eval_metrics,
                         environment=eval_env,
                         state_spec=algorithm.predict_state_spec,
-                        action_fn=functools.partial(
-                            driver.algorithm_step,
-                            training=False,
-                            greedy_predict=True),
+                        action_fn=lambda time_step, state: common.
+                        algorithm_step(
+                            algorithm=driver.algorithm,
+                            ob_transformer=driver.observation_transformer,
+                            time_step=time_step,
+                            state=state,
+                            greedy_predict=True,
+                            training=False),
                         num_episodes=num_eval_episodes,
                         step_metrics=driver.get_step_metrics(),
                         train_step=global_step,
@@ -148,39 +156,54 @@ def train(train_dir,
                     tf.summary.text('commandline', ' '.join(sys.argv))
 
         checkpointer.save(global_step=global_step.numpy())
+        env.pyenv.close()
+        if eval_env:
+            eval_env.pyenv.close()
 
     run_under_record_context(
         func=train_,
         summary_dir=train_dir,
         summary_interval=summary_interval,
-        flush_millis=summaries_flush_secs * 1000)
+        flush_millis=summaries_flush_secs * 1000,
+        summary_max_queue=summary_max_queue)
 
 
 @gin.configurable
-def play(train_dir,
+def play(root_dir,
          env,
          algorithm,
          checkpoint_name=None,
          greedy_predict=True,
          random_seed=0,
-         num_steps=10000,
+         num_episodes=10,
          sleep_time_per_step=0.01,
+         record_file=None,
          use_tf_functions=True):
     """Play using the latest checkpoint under `train_dir`.
 
+    The following example record the play of a trained model to a mp4 video:
+    ```bash
+    python -m alf.bin.main --play \
+    --root_dir=~/tmp/bullet_humanoid/ppo2/ppo2-11 \
+    --gin_param='on_policy_trainer.play.num_episodes=1' \
+    --gin_param='on_policy_trainer.play.record_file="ppo_bullet_humanoid.mp4"'
+    ```
     Args:
-        train_dir (str): same as the train_dir used for `train()`
+        root_dir (str): same as the root_dir used for `train()`
         env (TFEnvironment): the environment
         algorithm (OnPolicyAlgorithm): the training algorithm
         checkpoint_name (str): name of the checkpoint (e.g. 'ckpt-12800`).
             If None, the latest checkpoint unber train_dir will be used.
         greedy_predict (bool): use greedy action for evaluation.
         random_seed (int): random seed
-        num_steps (int): number of steps to play
+        num_episodes (int): number of episodes to play
         sleep_time_per_step (float): sleep so many seconds for each step
+        record_file (str): if provided, video will be recorded to a file
+            instead of shown on the screen.
         use_tf_functions (bool): whether to use tf.function
     """
-    train_dir = os.path.expanduser(train_dir)
+    root_dir = os.path.expanduser(root_dir)
+    train_dir = os.path.join(root_dir, 'train')
 
     tf.random.set_seed(random_seed)
     global_step = get_global_counter()
@@ -203,28 +226,43 @@ def play(train_dir,
     if ckpt_path is not None:
         logging.info("Restore from checkpoint %s" % ckpt_path)
         checkpoint.restore(ckpt_path)
+    else:
+        logging.info("Checkpoint is not found at %s" % ckpt_dir)
 
-    if use_tf_functions:
-        driver.run = tf.function(driver.run)
+    if not use_tf_functions:
+        tf.config.experimental_run_functions_eagerly(True)
 
-    # pybullet_envs need to `render()` before reset() to enable rendering.
-    env.pyenv.envs[0].render(mode='human')
+    recorder = None
+    if record_file is not None:
+        recorder = VideoRecorder(env.pyenv.envs[0], path=record_file)
+    else:
+        # pybullet_envs need to render() before reset() to enable mode='human'
+        env.pyenv.envs[0].render(mode='human')
     env.reset()
+    if recorder:
+        recorder.capture_frame()
     time_step = driver.get_initial_time_step()
-    policy_state = driver.get_initial_state()
+    policy_state = driver.get_initial_policy_state()
     episode_reward = 0.
     episode_length = 0
-    for _ in range(num_steps):
+    episodes = 0
+    while episodes < num_episodes:
         time_step, policy_state = driver.run(
             max_num_steps=1, time_step=time_step, policy_state=policy_state)
+        if recorder:
+            recorder.capture_frame()
+        else:
+            env.pyenv.envs[0].render(mode='human')
+            time.sleep(sleep_time_per_step)
         if time_step.is_last():
             logging.info("episode_length=%s episode_reward=%s" %
                          (episode_length, episode_reward))
             episode_reward = 0.
             episode_length = 0.
+            episodes += 1
         else:
             episode_reward += float(time_step.reward)
             episode_length += 1
-        env.pyenv.envs[0].render(mode='human')
-        time.sleep(sleep_time_per_step)
+    if recorder:
+        recorder.close()
     env.reset()
