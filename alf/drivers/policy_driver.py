@@ -67,8 +67,10 @@ class PolicyDriver(driver.Driver):
         standard_metrics = [
             tf_metrics.NumberOfEpisodes(),
             tf_metrics.EnvironmentSteps(),
-            tf_metrics.AverageReturnMetric(buffer_size=metric_buf_size),
-            tf_metrics.AverageEpisodeLengthMetric(buffer_size=metric_buf_size),
+            tf_metrics.AverageReturnMetric(
+                batch_size=env.batch_size, buffer_size=metric_buf_size),
+            tf_metrics.AverageEpisodeLengthMetric(
+                batch_size=env.batch_size, buffer_size=metric_buf_size),
         ]
         self._metrics = standard_metrics + metrics
         self._exp_observers = []
