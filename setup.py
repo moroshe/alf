@@ -27,6 +27,8 @@ setup(
         'psutil',
         'pybullet == 2.5.0',
         'pathos == 0.2.4',
+        'tf-agents-nightly == 0.2.0.dev20190807',
+        'tf-nightly-gpu-2.0-preview == 2.0.0.dev20190807',
     ],  # And any other dependencies foo needs
     packages=find_packages(),
 )
